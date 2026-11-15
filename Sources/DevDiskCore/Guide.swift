@@ -31,6 +31,12 @@ enum Guide {
       no later tool can know that as cheaply.
     - Keep evidence small: keep logs, screenshots and reports, not the build tree that produced them.
 
+    Protecting work in progress:
+    - devdisk never calls something safe while a process is working inside it, names it on its
+      command line, or a build tool that reads it (cargo, xcodebuild, swift-build, bun) is running.
+    - For anything that must survive between builds, add its path or a glob to
+      `~/.config/devdisk/exclude`, one per line. Remove the line when the work is merged.
+
     Cleaning up:
     - `devdisk scan --json` lists findings with a `tier`. `safe` is regenerable and unused;
       `devdisk clean --category <name> --apply` removes it without asking.

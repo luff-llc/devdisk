@@ -23,6 +23,12 @@ enum Rules {
                 let inUse = active.contains { Files.contains(path, $0) }
                 var finding = Finding(category: .tmp, path: path, ageDays: age, tier: .safe,
                                       reason: "temporary files untouched for \(age ?? 0) days", action: .delete)
+                // A linked git worktree must leave through git, so the repository's list stays true.
+                // Without --force, git refuses if the worktree has uncommitted changes.
+                if type == .typeDirectory, let repo = linkedWorktreeRepository(path) {
+                    finding.action = .command(["git", "-C", repo, "worktree", "remove", path])
+                    finding.reason = "git worktree of \(repo), untouched for \(age ?? 0) days"
+                }
                 if inUse {
                     finding.tier = .review
                     finding.reason = "a running process is working inside it"
@@ -34,6 +40,14 @@ enum Rules {
             }
         }
         return findings
+    }
+
+    /// For a linked worktree, the main repository it belongs to.
+    static func linkedWorktreeRepository(_ path: String) -> String? {
+        // `.git` is a file reading "gitdir: <repo>/.git/worktrees/<name>".
+        guard let text = try? String(contentsOfFile: path + "/.git", encoding: .utf8), text.hasPrefix("gitdir: "),
+              let range = text.range(of: "/.git/worktrees/") else { return nil }
+        return String(text[text.index(text.startIndex, offsetBy: 8)..<range.lowerBound])
     }
 
     // MARK: Build artifacts inside project roots
@@ -220,7 +234,10 @@ enum Rules {
             (dev + "/CoreSimulator/Caches", "simulator dyld caches, rebuilt on boot"),
             (o.home.path + "/Library/Caches/com.apple.dt.Xcode", "Xcode cache"),
         ] where isDirectory(path) {
-            findings.append(Finding(category: .xcode, path: path, tier: .safe, reason: reason, action: .delete))
+            let age = Files.ageDays(path, now: o.now, depth: 2)
+            let idle = (age ?? 0) >= o.artifactDays
+            findings.append(Finding(category: .xcode, path: path, ageDays: age, tier: idle ? .safe : .review,
+                                    reason: idle ? reason : reason + ", but used within \(o.artifactDays) days", action: .delete))
         }
         return findings
     }
@@ -298,8 +315,16 @@ enum Rules {
             ("Library/Caches/org.swift.swiftpm", "SwiftPM download cache"), ("Library/pnpm/store", "pnpm store"),
         ]
         for (relative, label) in known where isDirectory(home + "/" + relative) {
-            findings.append(Finding(category: .caches, path: home + "/" + relative, tier: .safe,
-                                    reason: label + "; re-downloaded on demand", action: .delete))
+            let path = home + "/" + relative
+            // Builds read these without touching them, and offline builds cannot re-download,
+            // so a cache is safe only after a long idle stretch. Protection also checks for running tools.
+            let age = Files.ageDays(path, now: o.now, depth: 2)
+            let idle = (age ?? 0) >= o.cacheDays || relative == "Library/Caches/Homebrew"
+            findings.append(Finding(
+                category: .caches, path: path, ageDays: age, tier: idle ? .safe : .review,
+                reason: idle ? label + ", untouched for \(age ?? 0) days; re-downloaded on demand"
+                             : label + ", added to within \(o.cacheDays) days; offline builds need it",
+                action: .delete))
         }
         for path in Files.children(home + "/.cache") where isDirectory(path) && !path.hasSuffix("/huggingface") {
             findings.append(Finding(category: .caches, path: path, ageDays: Files.ageDays(path, now: o.now), tier: .review,

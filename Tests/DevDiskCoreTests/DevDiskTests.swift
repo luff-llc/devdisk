@@ -35,6 +35,7 @@ final class DevDiskTests: XCTestCase {
                         roots: [base.appendingPathComponent("home/projects")],
                         categories: categories)
         o.minBytes = 0
+        o.activity = Activity()
         try fm.createDirectory(at: o.home, withIntermediateDirectories: true)
         return o
     }
@@ -300,5 +301,78 @@ final class DevDiskTests: XCTestCase {
 
         fm.createFile(atPath: modules + "/new-entry", contents: Data(count: 1))
         XCTAssertEqual(Scanner.scan(o).sizesFromCache, 0, "a changed folder is measured again")
+    }
+
+    // MARK: Protection
+
+    func testRunningBuildsKeepTheirCachesAndOutput() throws {
+        var o = try options([.artifacts, .caches])
+        let registry = try make("home/.cargo/registry", daysOld: 90)
+        let target = try make("home/projects/crate/target", daysOld: 30)
+        try make("home/projects/crate", file: "Cargo.toml")
+        let modules = try make("home/projects/app/node_modules", daysOld: 30)
+        let tier = { (o: Options, path: String) in Scanner.scan(o).findings.first { $0.path == path }?.tier }
+
+        XCTAssertEqual(tier(o, registry), .safe)
+        XCTAssertEqual(tier(o, target), .safe)
+
+        o.activity = Activity(commands: ["/Users/x/.cargo/bin/cargo build --offline"])
+        XCTAssertEqual(tier(o, registry), .review, "the registry is not safe while cargo runs anywhere")
+        XCTAssertEqual(tier(o, modules), .safe, "an unrelated project is unaffected")
+
+        o.activity = Activity(workingDirectories: [base.appendingPathComponent("home/projects/crate/src").path])
+        XCTAssertEqual(tier(o, target), .review, "a process working in the project protects its build output")
+        XCTAssertEqual(tier(o, registry), .safe)
+
+        o.activity = Activity(commands: ["rustc --crate-name x -L dependency=\(target)/debug/deps"])
+        XCTAssertEqual(tier(o, target), .review, "a compiler naming the folder protects it")
+    }
+
+    func testFreshCachesNeedReview() throws {
+        let o = try options([.caches])
+        let registry = try make("home/.cargo/registry/cache/index.crates.io", daysOld: 2)
+        let parent = (registry as NSString).deletingLastPathComponent
+        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-90 * 86400)], ofItemAtPath: parent)
+        let finding = Scanner.scan(o).findings.first { $0.path.hasSuffix(".cargo/registry") }
+        XCTAssertEqual(finding?.tier, .review, "a crate downloaded two levels down counts as recent use")
+    }
+
+    func testExclusionListProtectsPathsAndGlobs() throws {
+        var o = try options([.artifacts, .tmp])
+        let kept = try make("home/projects/wt/h1-build/node_modules", daysOld: 30)
+        let other = try make("home/projects/app/node_modules", daysOld: 30)
+        let review = try make("tmp/review-colophon05c", daysOld: 10)
+        let plain = try make("tmp/unrelated", daysOld: 10)
+        o.excludes = [base.appendingPathComponent("home/projects/wt").path, base.path + "/tmp/review-colophon05*"]
+        let findings = Scanner.scan(o).findings
+        let finding = { (path: String) in findings.first { $0.path == path } }
+        XCTAssertEqual(finding(kept)?.tier, .info)
+        XCTAssertEqual(finding(kept)?.action, Action.none)
+        XCTAssertEqual(finding(review)?.tier, .info)
+        XCTAssertEqual(finding(other)?.tier, .safe)
+        XCTAssertEqual(finding(plain)?.tier, .safe)
+
+        var request = CleanRequest()
+        request.categories = [.artifacts, .tmp]
+        request.paths = [kept]
+        request.allowReview = true
+        request.apply = true
+        let removed = Cleaner.clean(findings, request, options: o).map(\.path)
+        XCTAssertFalse(removed.contains(kept), "an excluded path cannot be removed even when named")
+        XCTAssertTrue(fm.fileExists(atPath: kept))
+
+        // A finding that contains a protected path is protected too.
+        o.excludes = [review + "/data.bin"]
+        XCTAssertEqual(Scanner.scan(o).findings.first { $0.path == review }?.tier, .info)
+    }
+
+    func testTmpWorktreeLeavesThroughGit() throws {
+        let o = try options([.tmp])
+        let wt = try make("tmp/review-wt", daysOld: 10)
+        try "gitdir: /repos/main/.git/worktrees/review-wt\n".write(toFile: wt + "/.git", atomically: true, encoding: .utf8)
+        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-10 * 86400)], ofItemAtPath: wt + "/.git")
+        try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-10 * 86400)], ofItemAtPath: wt)
+        let finding = Scanner.scan(o).findings.first { $0.path == wt }
+        XCTAssertEqual(finding?.action, .command(["git", "-C", "/repos/main", "worktree", "remove", wt]))
     }
 }

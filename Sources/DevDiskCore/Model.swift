@@ -73,6 +73,12 @@ public struct Options: Sendable {
     public var artifactDays = 7
     public var simulatorDays = 30
     public var maxDepth = 7
+    /// Paths and globs that are never offered for removal.
+    public var excludes: [String] = []
+    /// What is running. nil reads the live system; tests pass a fixed snapshot.
+    public var activity: Activity?
+    /// Shared download caches count as safe only after this many idle days.
+    public var cacheDays = 30
     /// Where measured sizes are remembered between runs; nil measures everything every time.
     public var sizeCache: URL?
     public var sizeCacheTTL: TimeInterval = 3600

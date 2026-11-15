@@ -86,6 +86,27 @@ devdisk sim reap            # dry run; add --apply
 - `reap` shuts down unleased simulators booted longer than `--idle` (2h; data is kept) and
   deletes unbootable ones and temporary ones (name contains `temp`/`tmp`) unused for `--temp-age` (1d).
 
+## Protecting work in progress
+
+A finding is never `safe` while it is in use. After every scan devdisk checks the running
+processes and demotes a finding to `review` when:
+
+- a process has its working directory inside it, or inside the project that owns a build folder;
+- a process names it on its command line (compilers and build tools pass their output paths);
+- it is a shared cache and a tool that reads it is running (`~/.cargo/registry` with `cargo` or
+  `rustc`, the SwiftPM and Xcode caches with `xcodebuild` or `swift-build`, and so on).
+
+Shared download caches are also `review` until nothing has been added to them for 30 days,
+because offline builds need them and reads leave no trace.
+
+For anything that must survive between builds, list it in `~/.config/devdisk/exclude`, one path
+or glob per line (`#` for comments, `~` for home), or pass `--exclude`. Excluded findings show
+as `info` and cannot be removed, even when named with `--path`. A finding that contains an
+excluded path is protected too.
+
+Temp folders that are git worktrees are removed with `git worktree remove`, so the repository's
+worktree list stays true and git refuses if there are uncommitted changes.
+
 ## Safety
 
 - `clean` re-scans and removes only findings from that scan. A `--path` that is not a finding is ignored.

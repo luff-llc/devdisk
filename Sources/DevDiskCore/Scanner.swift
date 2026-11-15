@@ -56,6 +56,7 @@ public enum Scanner {
             trace("rule \(rule.0.rawValue): \(found.count) candidates", since: ruleStart)
             return found
         }.flatMap { $0 }
+        findings = Protection.apply(findings, o, activity: o.activity ?? Activity.current())
 
         var cache = o.sizeCache.map { SizeCache(url: $0, ttl: o.sizeCacheTTL) }
         var sizes: [String: Int64] = [:]

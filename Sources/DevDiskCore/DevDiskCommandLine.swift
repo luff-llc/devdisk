@@ -1,7 +1,7 @@
 import Foundation
 
 public enum DevDiskCommandLine {
-    public static let version = "0.3.0"
+    public static let version = "0.3.1"
 
     static let usage = """
     devdisk \(version): explain and reclaim disk space used by local development
@@ -20,6 +20,7 @@ public enum DevDiskCommandLine {
       --older-than <days>   age before build artifacts and worktrees count as safe (default 7d)
       --tmp-older-than <days>  age before temp entries count as safe (default 3d)
       --top <n>             scan only: show the n largest findings (default 40, 0 = all)
+      --exclude <glob>      never offer this path or glob (also read from ~/.config/devdisk/exclude)
       --no-cache            measure every size now instead of reusing sizes from the last hour
       --cache-ttl <time>    how long a measured size is reused (default 1h)
 
@@ -31,7 +32,7 @@ public enum DevDiskCommandLine {
       --apply               actually remove; without it nothing is touched
 
     TIERS
-      safe     regenerable and unused; removed by clean
+      safe     regenerable, idle, and not in use by a running process; removed by clean
       review   needs a decision; removed only with --allow-review
       info     explains where space went; never removed by devdisk
 
@@ -50,6 +51,7 @@ public enum DevDiskCommandLine {
         var json = false, top = 40, allSafe = false, useCache = true
         var categories: Set<Category> = []
         var roots: [URL] = []
+        var excludes: [String] = []
 
         func fail(_ message: String) -> Int32 {
             FileHandle.standardError.write(Data("devdisk: \(message)\n".utf8))
@@ -81,6 +83,9 @@ public enum DevDiskCommandLine {
             case "--tmp-older-than":
                 guard let days = value().flatMap(parseDays) else { return fail("--tmp-older-than needs days such as 3d") }
                 options.tmpDays = days
+            case "--exclude":
+                guard let raw = value() else { return fail("--exclude needs a path or glob") }
+                excludes.append(expandTilde(raw, home: options.home))
             case "--no-cache": useCache = false
             case "--cache-ttl":
                 guard let ttl = value().flatMap(parseDuration) else { return fail("--cache-ttl needs a duration such as 1h") }
@@ -92,6 +97,7 @@ public enum DevDiskCommandLine {
             }
         }
         if !roots.isEmpty { options.roots = roots }
+        options.excludes = Protection.loadExcludes(home: options.home) + excludes
         if useCache { options.sizeCache = LeaseStore(home: options.home).url.deletingLastPathComponent().appendingPathComponent("sizes.json") }
 
         switch command {

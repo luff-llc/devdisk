@@ -158,13 +158,19 @@ enum Files {
         ((try? FileManager.default.attributesOfItem(atPath: path))?[.type] as? FileAttributeType) == .typeSymbolicLink
     }
 
-    /// Days since the path or any of its immediate children changed.
-    static func ageDays(_ path: String, now: Date) -> Int? {
+    /// Days since the path or anything within `depth` levels below it changed.
+    static func ageDays(_ path: String, now: Date, depth: Int = 1) -> Int? {
+        newest(path, depth: depth).map { max(0, Int(now.timeIntervalSince($0) / 86400)) }
+    }
+
+    private static func newest(_ path: String, depth: Int) -> Date? {
         var newest = modified(path)
+        guard depth > 0 else { return newest }
         for child in children(path).prefix(200) {
-            if let date = modified(child), newest.map({ date > $0 }) ?? true { newest = date }
+            let date = depth > 1 && isDirectory(child) ? Files.newest(child, depth: depth - 1) : modified(child)
+            if let date, newest.map({ date > $0 }) ?? true { newest = date }
         }
-        return newest.map { max(0, Int(now.timeIntervalSince($0) / 86400)) }
+        return newest
     }
 
     /// Working directories of this user's running processes.
