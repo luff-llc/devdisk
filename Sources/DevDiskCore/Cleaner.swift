@@ -35,23 +35,42 @@ public enum Cleaner {
     }
 
     public static func clean(_ findings: [Finding], _ request: CleanRequest, options: Options) -> [CleanResult] {
-        select(findings, request).map { finding in
+        let pressroomFolder = PressroomLeases.folder(home: options.home)
+        return select(findings, request).map { finding in
             var result = CleanResult(path: finding.path, bytes: finding.bytes, tier: finding.tier,
                                      outcome: "would-remove", detail: finding.reason)
             guard request.apply else { return result }
-            if let refusal = refusal(finding, options) {
+            // A job may have started since the scan, so pressroom's leases are read again for every path.
+            let leases = options.pressroom ?? PressroomLeases.load(from: pressroomFolder)
+            if let refusal = refusal(finding, options) ?? leases.refusal(finding.path).map({ "skipped: " + $0 }) {
                 result.outcome = "skipped"
                 result.detail = refusal
                 return result
             }
             switch finding.action {
             case .delete:
+                // Inside pressroom's folders, removal goes through its delete lease so no job can
+                // take a lease on the path mid-removal (contract rule 17).
+                var deleteLease: String?
+                if Files.contains(pressroomFolder.path, finding.path), let tool = Rules.pressroomTool() {
+                    let begin = Shell.run(tool, ["delete-begin", "--holder", "devdisk", finding.path], timeout: 30)
+                    guard begin.status == 0 else {
+                        result.outcome = "skipped"
+                        result.detail = "pressroom refused: " + begin.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                        log(result, home: options.home)
+                        return result
+                    }
+                    deleteLease = begin.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
                 do {
                     try FileManager.default.removeItem(atPath: finding.path)
                     result.outcome = "removed"
                 } catch {
                     result.outcome = "failed"
                     result.detail = error.localizedDescription
+                }
+                if let id = deleteLease, let tool = Rules.pressroomTool() {
+                    Shell.run(tool, ["delete-end", id], timeout: 30)
                 }
             case .command(let argv):
                 let run = Shell.run(argv[0], Array(argv.dropFirst()))

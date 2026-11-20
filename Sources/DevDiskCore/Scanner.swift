@@ -2,16 +2,29 @@ import Foundation
 
 public struct VolumeStatus: Codable, Sendable {
     public var totalBytes: Int64
+    /// Free right now, the figure `df` reports and pressroom's disk floor uses.
     public var freeBytes: Int64
-    /// `ok`, `low` (under 10% or 50 GB) or `critical` (under 5% or 20 GB).
+    /// Free once macOS evicts purgeable data (snapshots, iCloud copies, caches it manages).
+    /// It can be far larger than `freeBytes`, and a build cannot count on it.
+    public var freeIncludingPurgeableBytes: Int64
+    /// From `freeBytes`: `ok`, `low` (under 10% or 50 GB) or `critical` (under 5% or 20 GB).
     public var pressure: String
 
     public static func read(path: String = NSHomeDirectory()) -> VolumeStatus {
-        let values = try? URL(fileURLWithPath: path).resourceValues(
-            forKeys: [.volumeTotalCapacityKey, .volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
-        let total = Int64(values?.volumeTotalCapacity ?? 0)
-        let free = max(values?.volumeAvailableCapacityForImportantUsage ?? 0, Int64(values?.volumeAvailableCapacity ?? 0))
-        return VolumeStatus(totalBytes: total, freeBytes: free, pressure: pressure(total: total, free: free))
+        var fs = statfs()
+        let now: Int64 = statfs(path, &fs) == 0 ? Int64(fs.f_bavail) * Int64(fs.f_bsize) : 0
+        let total: Int64 = Int64(fs.f_blocks) * Int64(fs.f_bsize)
+        let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        let purgeable = max(now, values?.volumeAvailableCapacityForImportantUsage ?? 0)
+        return VolumeStatus(totalBytes: total, freeBytes: now, freeIncludingPurgeableBytes: purgeable,
+                            pressure: pressure(total: total, free: now))
+    }
+
+    /// "20.1G free (35.5G counting purgeable) of 926.4G, pressure: critical"
+    public var summary: String {
+        let purgeable = freeIncludingPurgeableBytes - freeBytes > 1 << 30
+            ? " (\(formatBytes(freeIncludingPurgeableBytes)) counting purgeable)" : ""
+        return "\(formatBytes(freeBytes)) free\(purgeable) of \(formatBytes(totalBytes)), pressure: \(pressure)"
     }
 
     public static func pressure(total: Int64, free: Int64) -> String {
@@ -46,7 +59,7 @@ public enum Scanner {
         let started = Date()
         let rules: [(Category, (Options) -> [Finding])] = [
             (.tmp, Rules.tmp), (.artifacts, Rules.artifacts), (.worktrees, Rules.worktrees), (.xcode, Rules.xcode),
-            (.simulators, Rules.simulators), (.caches, Rules.caches), (.browsers, Rules.browsers),
+            (.simulators, Rules.simulators), (.caches, Rules.caches), (.caches, Rules.pressroom), (.browsers, Rules.browsers),
             (.agents, Rules.agents), (.models, Rules.models), (.containers, Rules.containers),
         ].filter { o.categories.contains($0.0) }
 
@@ -56,7 +69,7 @@ public enum Scanner {
             trace("rule \(rule.0.rawValue): \(found.count) candidates", since: ruleStart)
             return found
         }.flatMap { $0 }
-        findings = Protection.apply(findings, o, activity: o.activity ?? Activity.current())
+        findings = Protection.apply(findings, o, activity: o.activity ?? Activity.current(home: o.home))
 
         var cache = o.sizeCache.map { SizeCache(url: $0, ttl: o.sizeCacheTTL) }
         var sizes: [String: Int64] = [:]

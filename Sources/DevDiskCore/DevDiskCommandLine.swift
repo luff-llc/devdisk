@@ -1,16 +1,20 @@
 import Foundation
 
 public enum DevDiskCommandLine {
-    public static let version = "0.3.1"
+    public static let version = "0.6.0"
 
     static let usage = """
     devdisk \(version): explain and reclaim disk space used by local development
 
     USAGE
       devdisk status [--json]                 free space and pressure (ok | low | critical)
+      devdisk status --need <size> [--floor <size>]   room for a job writing <size>? If not, which
+                                              safe findings make room (exit 3 when there is not room)
       devdisk scan   [filters] [--json]       list what is using space, by category and tier
       devdisk clean  <selection> [--apply]    remove findings; a dry run unless --apply is given
       devdisk sim    <status|acquire|release|reap>   shared simulator pool; see `devdisk sim help`
+      devdisk claim <path>... [--kind build|scratch|worktree]   mark what this session created
+      devdisk finish [--apply]                remove what this session claimed; see `devdisk claim help`
       devdisk guide                           conventions for coding agents (paste into AGENTS.md)
 
     FILTERS (scan and clean)
@@ -45,10 +49,14 @@ public enum DevDiskCommandLine {
             return 0
         }
         if command == "sim" { return SimCommand.run(Array(arguments.dropFirst())) }
+        if ["claim", "claims", "unclaim", "finish"].contains(command) {
+            return ClaimCommand.run(command, Array(arguments.dropFirst()))
+        }
         var args = Array(arguments.dropFirst())
         var options = Options()
         var request = CleanRequest()
         var json = false, top = 40, allSafe = false, useCache = true
+        var need: Int64?, floor: Int64?
         var categories: Set<Category> = []
         var roots: [URL] = []
         var excludes: [String] = []
@@ -86,6 +94,12 @@ public enum DevDiskCommandLine {
             case "--exclude":
                 guard let raw = value() else { return fail("--exclude needs a path or glob") }
                 excludes.append(expandTilde(raw, home: options.home))
+            case "--need":
+                guard let bytes = value().flatMap(parseBytes) else { return fail("--need needs a size such as 4G") }
+                need = bytes
+            case "--floor":
+                guard let bytes = value().flatMap(parseBytes) else { return fail("--floor needs a size such as 20G") }
+                floor = bytes
             case "--no-cache": useCache = false
             case "--cache-ttl":
                 guard let ttl = value().flatMap(parseDuration) else { return fail("--cache-ttl needs a duration such as 1h") }
@@ -109,9 +123,15 @@ public enum DevDiskCommandLine {
             print(Guide.text)
         case "status":
             let status = VolumeStatus.read()
-            if json { emit(status) } else {
-                print("\(formatBytes(status.freeBytes)) free of \(formatBytes(status.totalBytes)), pressure: \(status.pressure)")
+            guard let need else {
+                if json { emit(status) } else { print(status.summary) }
+                return 0
             }
+            let plan = RoomPlan.plan(need: need, floor: floor ?? RoomPlan.floor(home: options.home), volume: status) {
+                Scanner.scan(options)
+            }
+            if json { emit(plan) } else { printRoom(plan, status) }
+            return plan.enough ? 0 : 3
         case "scan":
             if !categories.isEmpty { options.categories = categories }
             let report = Scanner.scan(options)
@@ -147,7 +167,7 @@ public enum DevDiskCommandLine {
 
     private static func printScan(_ report: ScanReport, top: Int) {
         let volume = report.volume
-        print("\(formatBytes(volume.freeBytes)) free of \(formatBytes(volume.totalBytes)), pressure: \(volume.pressure)")
+        print(volume.summary)
         print("project roots: \(report.roots.isEmpty ? "(none found; pass --root)" : report.roots.joined(separator: ", "))\n")
 
         print("BY CATEGORY (nested findings counted once)")
@@ -171,6 +191,26 @@ public enum DevDiskCommandLine {
         print("\nScanned in \(report.seconds)s\(report.sizesFromCache > 0 ? ", \(report.sizesFromCache) sizes reused from the last hour (--no-cache to re-measure)" : "").")
         print("TOTAL  safe \(total("safe"))   review \(total("review"))   info \(total("info"))")
         print("Reclaim the safe tier with `devdisk clean --all-safe` (dry run), then add --apply.")
+    }
+
+    static func printRoom(_ plan: RoomPlan, _ status: VolumeStatus) {
+        print(status.summary)
+        let room = plan.freeBytes - plan.floorBytes
+        if plan.enough {
+            print("Room for \(formatBytes(plan.needBytes)): \(formatBytes(room)) above the \(formatBytes(plan.floorBytes)) floor.")
+            return
+        }
+        print("Not enough room for \(formatBytes(plan.needBytes)): \(formatBytes(max(0, room))) above the \(formatBytes(plan.floorBytes)) floor, short by \(formatBytes(plan.shortfallBytes)).")
+        guard !plan.findings.isEmpty else {
+            print("No safe findings to clean; see `devdisk scan` for review items.")
+            return
+        }
+        print(plan.coverable ? "These safe findings would make room (\(formatBytes(plan.findingsBytes)) measured; shared APFS blocks can free less):"
+                             : "Every safe finding together is \(formatBytes(plan.findingsBytes)), not enough; review items are needed too:")
+        for finding in plan.findings {
+            print("  \(formatBytes(finding.bytes).padding(toLength: 7, withPad: " ", startingAt: 0)) \(finding.path)")
+        }
+        print("Remove them with:\n  " + plan.command.map { $0.contains(" ") ? "'\($0)'" : $0 }.joined(separator: " "))
     }
 
     private static func printClean(_ results: [CleanResult], apply: Bool, before: VolumeStatus) {

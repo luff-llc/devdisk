@@ -77,6 +77,8 @@ public struct Options: Sendable {
     public var excludes: [String] = []
     /// What is running. nil reads the live system; tests pass a fixed snapshot.
     public var activity: Activity?
+    /// Pressroom's live leases. nil reads its lease files; tests pass a fixed set.
+    public var pressroom: PressroomLeases?
     /// Shared download caches count as safe only after this many idle days.
     public var cacheDays = 30
     /// Where measured sizes are remembered between runs; nil measures everything every time.
@@ -90,7 +92,7 @@ public struct Options: Sendable {
         self.home = home
         self.categories = categories
         self.tmpDirs = tmpDirs ?? Options.defaultTmpDirs()
-        self.roots = roots ?? Options.defaultRoots(home: home)
+        self.roots = roots ?? Options.defaultRoots(home: home) + Rules.openclawRoots(home: home)
     }
 
     static func defaultTmpDirs() -> [URL] {

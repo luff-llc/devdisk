@@ -328,6 +328,256 @@ final class DevDiskTests: XCTestCase {
         XCTAssertEqual(tier(o, target), .review, "a compiler naming the folder protects it")
     }
 
+    func testScheduledJobsKeepTheirProjectsBuildOutput() throws {
+        var o = try options([.artifacts])
+        let modules = try make("home/projects/pipeline/app/node_modules", daysOld: 60)
+        let other = try make("home/projects/idle/node_modules", daysOld: 60)
+        let agents = base.appendingPathComponent("home/Library/LaunchAgents")
+        try fm.createDirectory(at: agents, withIntermediateDirectories: true)
+        let job: [String: Any] = ["Label": "x.pipeline", "ProgramArguments": ["/bin/zsh", "-lc", "cd ~/projects/pipeline/jobs && bun run pull.ts"]]
+        try PropertyListSerialization.data(fromPropertyList: job, format: .xml, options: 0)
+            .write(to: agents.appendingPathComponent("x.pipeline.plist"))
+        o.activity = Activity(scheduled: Activity.scheduledPaths(home: o.home))
+        let found = Scanner.scan(o).findings
+        XCTAssertEqual(found.first { $0.path == modules }?.tier, .review, "a timer job elsewhere in the project protects it")
+        XCTAssertEqual(found.first { $0.path == other }?.tier, .safe)
+    }
+
+    func testOpenClawTiers() throws {
+        let o = try options([.agents, .artifacts])
+        let claw = "home/.openclaw"
+        let oldBackup = try make("\(claw)/backups/update-20261001", daysOld: 40)
+        let newBackup = try make("\(claw)/backups/repair-20261112", daysOld: 2)
+        let oldTmp = try make("\(claw)/tmp/playwright-artifacts-AbC123", daysOld: 20)
+        let newTmp = try make("\(claw)/tmp/sandbox-xYz789", daysOld: 1)
+        let liveTmp = try make("\(claw)/tmp/node-compile-cache", daysOld: 20)
+        let current = try make("\(claw)/runtime/2026.11.1-release", daysOld: 10)
+        let previous = try make("\(claw)/runtime/2026.10.10-release", daysOld: 12)
+        let spent = try make("\(claw)/runtime/2026.10.8-release", daysOld: 30)
+        try fm.createSymbolicLink(atPath: base.path + "/\(claw)/runtime/current", withDestinationPath: "2026.11.1-release")
+        try fm.createSymbolicLink(atPath: base.path + "/\(claw)/runtime/previous", withDestinationPath: previous)
+        let profile = try make("\(claw)/browser/imported/user-data", daysOld: 50)
+        let state = try make("\(claw)/agents/main/agent", daysOld: 0, file: "openclaw-agent.sqlite.pre-startup-migration-1.bak")
+        let keys = try make("home/projects/chain/target/deploy", daysOld: 60, file: "program-keypair.json")
+        try make("home/projects/chain", file: "Cargo.toml")
+
+        let found = Scanner.scan(o).findings
+        let tier = { (path: String) in found.first { $0.path == path }?.tier }
+        XCTAssertEqual(tier(oldBackup), .review)
+        XCTAssertEqual(tier(newBackup), .info)
+        XCTAssertEqual(tier(oldTmp), .safe)
+        XCTAssertEqual(tier(newTmp), .review)
+        XCTAssertNil(tier(liveTmp), "live scratch folders are never offered")
+        XCTAssertEqual(tier(current), .info)
+        XCTAssertEqual(tier(previous), .info)
+        XCTAssertEqual(tier(spent), .safe)
+        XCTAssertEqual(tier((profile as NSString).deletingLastPathComponent), .review)
+        XCTAssertEqual(tier(state + "/openclaw-agent.sqlite.pre-startup-migration-1.bak"), .info)
+        XCTAssertEqual(tier((keys as NSString).deletingLastPathComponent), .review, "a target folder with program keypairs is not regenerable")
+    }
+
+    // MARK: Split folders, pressroom, volume
+
+    private func git(_ args: String..., in dir: String) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = ["-C", dir] + args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try? p.run()
+        p.waitUntilExit()
+    }
+
+    func testReleaseOutputIsSplitAndReceiptsStay() throws {
+        let o = try options([.artifacts])
+        let app = base.appendingPathComponent("home/projects/app").path
+        let oldArchive = try make("home/projects/app/build/releases/1.0-1/App.xcarchive", daysOld: 40)
+        let newArchive = try make("home/projects/app/build/releases/1.1-2/App.xcarchive", daysOld: 35)
+        let receipts = try make("home/projects/app/build/releases/1.0-1", file: "upload.json")
+        let review = try make("home/projects/app/build/reviews/2026-10-01-search", daysOld: 40)
+        try "build/\n".write(toFile: app + "/.gitignore", atomically: true, encoding: .utf8)
+        git("init", "-q", in: app)
+
+        let findings = Scanner.scan(o).findings
+        let tier = { (path: String) in findings.first { $0.path == path }?.tier }
+        XCTAssertEqual(tier(app + "/build"), .info)
+        XCTAssertEqual(tier(app + "/build/releases"), .info)
+        XCTAssertEqual(tier(oldArchive), .safe)
+        XCTAssertEqual(tier(newArchive), .review, "the newest archive of an app is kept even when old")
+        XCTAssertEqual(tier(review), .review)
+        XCTAssertNil(tier(receipts), "a release folder holding receipts is never offered")
+        var all = CleanRequest()
+        all.categories = Set(DevDiskCore.Category.allCases)
+        let chosen = Cleaner.select(findings, all).map(\.path)
+        XCTAssertEqual(chosen, [oldArchive], "a safe clean takes the old archive and nothing beside it")
+    }
+
+    func testUploadReceiptDecidesArchive() throws {
+        let o = try options([.artifacts])
+        let app = base.appendingPathComponent("home/projects/app").path
+        let processed = try make("home/projects/app/build/releases/2.0-5/ios/App.xcarchive", daysOld: 1)
+        let pending = try make("home/projects/app/build/releases/2.0-6/ios/App.xcarchive", daysOld: 1)
+        for (archive, verified) in [(processed, true), (pending, false)] {
+            let receipt = #"{"status":"uploaded","processing_verified":\#(verified),"archive":"\#(archive)","ipa_sha256":"ab"}"#
+            try receipt.write(toFile: (archive as NSString).deletingLastPathComponent + "/upload.json", atomically: true, encoding: .utf8)
+        }
+        try "build/\n".write(toFile: app + "/.gitignore", atomically: true, encoding: .utf8)
+        git("init", "-q", in: app)
+        let findings = Scanner.scan(o).findings
+        XCTAssertEqual(findings.first { $0.path == processed }?.tier, .safe, "uploaded and processed: the receipt is the evidence")
+        XCTAssertEqual(findings.first { $0.path == pending }?.tier, .review, "processing not verified yet")
+
+        // A later verify step records processing beside the receipt instead of editing it.
+        let verified = #"{"status":"VALID","asc_build_id":"1","observed_utc":"2026-11-20T20:00:00Z"}"#
+        try verified.write(toFile: (pending as NSString).deletingLastPathComponent + "/processing.json", atomically: true, encoding: .utf8)
+        XCTAssertEqual(Scanner.scan(o).findings.first { $0.path == pending }?.tier, .safe, "processing.json with VALID counts")
+    }
+
+    func testRoomPlanNamesSafeFindings() {
+        let gb: Int64 = 1 << 30
+        let volume = VolumeStatus(totalBytes: 900 * gb, freeBytes: 22 * gb, freeIncludingPurgeableBytes: 30 * gb, pressure: "critical")
+        let finding = { (path: String, size: Int64, tier: Tier) in
+            Finding(category: .artifacts, path: path, bytes: size * gb, tier: tier, reason: "", action: .delete)
+        }
+        let report = ScanReport(volume: volume, roots: [], findings: [
+            finding("/a", 1, .safe), finding("/b", 3, .safe), finding("/c", 9, .review), finding("/d", 2, .safe),
+        ], totals: [:], belowMinimum: [:], sizesFromCache: 0, seconds: 0)
+        XCTAssertTrue(RoomPlan.plan(need: 1 * gb, floor: 20 * gb, volume: volume) { report }.enough)
+        let plan = RoomPlan.plan(need: 6 * gb, floor: 20 * gb, volume: volume) { report }
+        XCTAssertFalse(plan.enough)
+        XCTAssertEqual(plan.shortfallBytes, 4 * gb)
+        XCTAssertEqual(plan.findings.map(\.path), ["/b", "/d"], "largest safe findings first, review items never")
+        XCTAssertTrue(plan.coverable)
+    }
+
+    func testKeyedCacheKeepsNewestKeys() throws {
+        let o = try options([.tmp])
+        let cache = "tmp/app-build-cache"
+        let newest = try make("\(cache)/aaa", daysOld: 0)
+        try make("\(cache)/bbb", daysOld: 0)
+        let older = try make("\(cache)/ccc", daysOld: 2)
+        let oldest = try make("\(cache)/ddd", daysOld: 5)
+        let findings = Scanner.scan(o).findings
+        let tier = { (path: String) in findings.first { $0.path == path }?.tier }
+        XCTAssertEqual(tier(base.appendingPathComponent(cache).path), .info)
+        XCTAssertEqual(tier(newest), .review)
+        XCTAssertEqual(tier(older), .safe)
+        XCTAssertEqual(tier(oldest), .safe)
+    }
+
+    func testScratchpadsFollowSessionActivity() throws {
+        let o = try options([.tmp])
+        let idle = try make("tmp/claude-501/project/session-idle/scratchpad", daysOld: 10)
+        let live = try make("tmp/claude-501/project/session-live/scratchpad", daysOld: 10)
+        try make("home/.claude/projects/project", file: "session-live.jsonl")
+        for session in [idle, live] {
+            try fm.setAttributes([.modificationDate: Date().addingTimeInterval(-10 * 86400)],
+                                 ofItemAtPath: (session as NSString).deletingLastPathComponent)
+        }
+        let findings = Scanner.scan(o).findings
+        let tier = { (path: String) in findings.first { $0.path == (path as NSString).deletingLastPathComponent }?.tier }
+        XCTAssertEqual(tier(idle), .safe)
+        XCTAssertEqual(tier(live), .review, "a session whose transcript changed today keeps its scratchpad")
+    }
+
+    func testPressroomLeasesProtectPaths() throws {
+        var o = try options([.artifacts])
+        let leased = try make("home/projects/app/node_modules", daysOld: 30)
+        let other = try make("home/projects/web/node_modules", daysOld: 30)
+        let leases = base.appendingPathComponent("home/.pressroom/leases")
+        try fm.createDirectory(at: leases, withIntermediateDirectories: true)
+        let expires = Int(Date().timeIntervalSince1970) + 3600
+        let lease = #"{"version":"pressroom.lease/1","id":"j1","holder":"agent:taupe","kind":"worktree","mode":"in-use","paths":["\#(base.appendingPathComponent("home/projects/app").path)"],"created":1,"expires":\#(expires)}"#
+        try lease.write(to: leases.appendingPathComponent("j1.json"), atomically: true, encoding: .utf8)
+
+        var findings = Scanner.scan(o).findings
+        XCTAssertEqual(findings.first { $0.path == leased }?.tier, .info, "a path inside a leased worktree is left alone")
+        XCTAssertEqual(findings.first { $0.path == other }?.tier, .safe)
+
+        try "not json".write(to: leases.appendingPathComponent("broken.json"), atomically: true, encoding: .utf8)
+        findings = Scanner.scan(o).findings
+        XCTAssertEqual(findings.first { $0.path == other }?.tier, .review, "an unreadable lease could cover anything")
+
+        // A lease taken after the scan still stops the removal.
+        try fm.removeItem(at: leases.appendingPathComponent("broken.json"))
+        findings = Scanner.scan(o).findings
+        let late = lease.replacingOccurrences(of: "projects/app", with: "projects/web")
+        try late.write(to: leases.appendingPathComponent("j2.json"), atomically: true, encoding: .utf8)
+        o.pressroom = nil
+        var request = CleanRequest()
+        request.categories = [.artifacts]
+        request.apply = true
+        let results = Cleaner.clean(findings, request, options: o)
+        XCTAssertEqual(results.first { $0.path == other }?.outcome, "skipped")
+        XCTAssertTrue(fm.fileExists(atPath: other))
+    }
+
+    func testVolumeSummaryShowsBothFreeFigures() {
+        let gb: Int64 = 1 << 30
+        let v = VolumeStatus(totalBytes: 926 * gb, freeBytes: 20 * gb, freeIncludingPurgeableBytes: 35 * gb,
+                             pressure: VolumeStatus.pressure(total: 926 * gb, free: 20 * gb))
+        XCTAssertEqual(v.summary, "20.0G free (35.0G counting purgeable) of 926.0G, pressure: critical")
+    }
+
+    func testExclusionExceptions() throws {
+        var o = try options([.artifacts])
+        let project = base.appendingPathComponent("home/projects/crate").path
+        let target = try make("home/projects/crate/target", daysOld: 30)
+        try make("home/projects/crate", file: "Cargo.toml")
+        o.excludes = [project]
+        XCTAssertEqual(Scanner.scan(o).findings.first { $0.path == target }?.tier, .info)
+        o.excludes = [project, "!" + target]
+        XCTAssertEqual(Scanner.scan(o).findings.first { $0.path == target }?.tier, .safe, "an exception reopens target/")
+    }
+
+    func testClaimsProtectAndFinishRemoves() throws {
+        var o = try options([.tmp])
+        let store = LeaseStore(url: base.appendingPathComponent("home/.local/state/devdisk/leases.json"))
+        let scratch = try make("tmp/session-a-clone", daysOld: 10)
+        let build = try make("tmp/session-a-build", daysOld: 0)
+        let theirs = try make("tmp/session-b-clone", daysOld: 10)
+        o.pressroom = PressroomLeases()
+        Claims.claim([scratch], kind: .scratch, owner: "a", ttl: 3600, store: store)
+        Claims.claim([build], kind: .build, owner: "a", ttl: 3600, store: store)
+        Claims.claim([theirs], kind: .scratch, owner: "b", ttl: 3600, store: store)
+
+        let findings = Scanner.scan(o).findings
+        XCTAssertEqual(findings.first { $0.path == scratch }?.tier, .info, "a live claim keeps other cleanups away, however old")
+
+        let dry = Claims.finish(owner: "a", apply: false, options: o, store: store, activity: Activity())
+        XCTAssertEqual(Set(dry.map(\.outcome)), ["would-remove"])
+        XCTAssertTrue(fm.fileExists(atPath: build))
+
+        let done = Claims.finish(owner: "a", apply: true, options: o, store: store, activity: Activity())
+        XCTAssertEqual(done.filter { $0.outcome == "removed" }.count, 2, "fresh build output goes too: its owner is done with it")
+        XCTAssertFalse(fm.fileExists(atPath: scratch))
+        XCTAssertTrue(fm.fileExists(atPath: theirs), "another owner's claim is untouched")
+        XCTAssertEqual(Claims.live(store).map(\.owner), ["b"], "the finished owner's claims are dropped")
+    }
+
+    func testFinishKeepsDirtyWorktree() throws {
+        var o = try options([.tmp])
+        o.pressroom = PressroomLeases()
+        let store = LeaseStore(url: base.appendingPathComponent("home/.local/state/devdisk/leases.json"))
+        let repo = base.appendingPathComponent("home/projects/repo").path
+        try fm.createDirectory(atPath: repo, withIntermediateDirectories: true)
+        git("init", "-q", "-b", "main", in: repo)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init", in: repo)
+        let wt = base.appendingPathComponent("tmp/wt").path
+        git("worktree", "add", "-q", "-b", "feature", wt, in: repo)
+        try "change".write(toFile: wt + "/new.txt", atomically: true, encoding: .utf8)
+        Claims.claim([wt], kind: .worktree, owner: "a", ttl: 3600, store: store)
+        let results = Claims.finish(owner: "a", apply: true, options: o, store: store, activity: Activity())
+        XCTAssertEqual(results.first?.outcome, "kept")
+        XCTAssertTrue(fm.fileExists(atPath: wt + "/new.txt"))
+
+        try fm.removeItem(atPath: wt + "/new.txt")
+        Claims.claim([wt], kind: .worktree, owner: "a", ttl: 3600, store: store)
+        XCTAssertEqual(Claims.finish(owner: "a", apply: true, options: o, store: store, activity: Activity()).first?.outcome, "removed",
+                       "a clean worktree whose commit is on main leaves through git")
+        XCTAssertFalse(fm.fileExists(atPath: wt))
+    }
+
     func testFreshCachesNeedReview() throws {
         let o = try options([.caches])
         let registry = try make("home/.cargo/registry/cache/index.crates.io", daysOld: 2)

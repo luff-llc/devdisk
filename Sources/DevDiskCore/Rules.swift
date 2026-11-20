@@ -16,6 +16,10 @@ enum Rules {
                       type == .typeDirectory || type == .typeRegular else { continue }
                 let name = (path as NSString).lastPathComponent
                 if name.hasPrefix("com.apple.") || name == "TemporaryItems" { continue }
+                if type == .typeDirectory, let parts = splitTmp(path, name: name, o) {
+                    findings += parts
+                    continue
+                }
                 // An entry modified recently is "review" whatever its children say, so only old
                 // entries pay for the look inside.
                 let own = (attrs[.modificationDate] as? Date).map { max(0, Int(o.now.timeIntervalSince($0) / 86400)) }
@@ -68,8 +72,9 @@ enum Rules {
         var findings: [Finding] = []
         for root in o.roots {
             for entry in listing(root.path) where entry.isDirectory {
-                if let finding = classify(entry.path, in: root.path, o) {
-                    findings.append(finding)
+                let found = classify(entry.path, in: root.path, o)
+                if !found.isEmpty {
+                    findings += found
                 } else if entry.name != ".git" {
                     starts.append((entry.path, 1))
                 }
@@ -100,12 +105,32 @@ enum Rules {
         }
     }
 
-    /// A finding if `path` is a build artifact, nil if it is an ordinary directory to descend into.
-    private static func classify(_ path: String, in dir: String, _ o: Options) -> Finding? {
+    /// Findings if `path` is a build artifact, none if it is an ordinary directory to descend into.
+    private static func classify(_ path: String, in dir: String, _ o: Options) -> [Finding] {
+        let name = (path as NSString).lastPathComponent
+        if ignoredOutputNames.contains(name) {
+            guard gitIgnores(path, in: dir) else { return [] }
+            return splitOutput(path, o) ?? [Finding(
+                category: .artifacts, path: path, ageDays: Files.ageDays(path, now: o.now), tier: .review,
+                reason: "git-ignored output folder; may hold release builds or evidence worth keeping",
+                action: .delete)]
+        }
+        return classifyOne(path, in: dir, o).map { [$0] } ?? []
+    }
+
+    private static func classifyOne(_ path: String, in dir: String, _ o: Options) -> Finding? {
         let name = (path as NSString).lastPathComponent
         var regenerable = alwaysArtifacts.contains(name)
         if let markers = markerArtifacts[name] {
             regenerable = markers.contains { FileManager.default.fileExists(atPath: dir + "/" + $0) }
+        }
+        // Anchor writes Solana program keypairs into target/deploy; those cannot be rebuilt.
+        if regenerable, name == "target",
+           Files.children(path + "/deploy").contains(where: { $0.hasSuffix("-keypair.json") }) {
+            return Finding(
+                category: .artifacts, path: path, ageDays: Files.ageDays(path, now: o.now), tier: .review,
+                reason: "build output that also holds Solana program keypairs in target/deploy; back them up first",
+                action: .delete)
         }
         if regenerable {
             let age = Files.ageDays(path, now: o.now)
@@ -116,20 +141,15 @@ enum Rules {
                               : "regenerable \(name), untouched for \(age ?? 0) days",
                 action: .delete)
         }
-        if ignoredOutputNames.contains(name), gitIgnores(path, in: dir) {
-            return Finding(
-                category: .artifacts, path: path, ageDays: Files.ageDays(path, now: o.now), tier: .review,
-                reason: "git-ignored output folder; may hold release builds or evidence worth keeping",
-                action: .delete)
-        }
         return nil
     }
 
     private static func walk(_ dir: String, depth: Int, _ o: Options, _ findings: inout [Finding]) {
         guard depth <= o.maxDepth else { return }
         for entry in listing(dir) where entry.isDirectory && entry.name != ".git" {
-            if let finding = classify(entry.path, in: dir, o) {
-                findings.append(finding)
+            let found = classify(entry.path, in: dir, o)
+            if !found.isEmpty {
+                findings += found
             } else {
                 walk(entry.path, depth: depth + 1, o, &findings)
             }
@@ -148,6 +168,10 @@ enum Rules {
             for path in [root.path] + Files.children(root.path) where isDirectory(path + "/.git") {
                 repos.append(path)
             }
+        }
+        // OpenClaw keeps worktrees in one folder, away from the repositories they belong to.
+        for path in Files.children(o.home.path + "/.openclaw/worktrees") {
+            if let repo = linkedWorktreeRepository(path), !repos.contains(repo) { repos.append(repo) }
         }
         return parallelMap(repos) { worktrees(ofRepo: $0, o) }.flatMap { $0 }
     }
@@ -246,7 +270,11 @@ enum Rules {
 
     static func simulators(_ o: Options) -> [Finding] {
         var findings: [Finding] = []
+        var usedBy: [String: [String]] = [:]
         let iso = ISO8601DateFormatter()
+        let limits = SimLimits()
+        let temp = try? NSRegularExpression(pattern: limits.tempPattern)
+        let leased = Set(LeaseStore(home: o.home).read().filter { $0.expiresAt > o.now }.map(\.id))
         func age(_ value: Any?) -> Int? {
             (value as? String).flatMap(iso.date).map { max(0, Int(o.now.timeIntervalSince($0) / 86400)) }
         }
@@ -258,6 +286,7 @@ enum Rules {
                 for device in devices {
                     guard let udid = device["udid"] as? String, let dataPath = device["dataPath"] as? String else { continue }
                     let name = device["name"] as? String ?? udid
+                    usedBy[runtime, default: []].append(name)
                     let used = age(device["lastUsedAt"])
                     var finding = Finding(
                         category: .simulators, path: (dataPath as NSString).deletingLastPathComponent,
@@ -270,6 +299,11 @@ enum Rules {
                     } else if device["state"] as? String == "Booted" {
                         finding.reason = "simulator \(name) (\(runtimeName)) is booted"
                         finding.action = .none
+                    } else if !leased.contains(udid), device["state"] as? String == "Shutdown",
+                              temp?.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil,
+                              (used ?? Int.max) >= Int(limits.tempAge / 86400) {
+                        finding.tier = .safe
+                        finding.reason = "temporary simulator \(name) (\(runtimeName)) unused for \(simulatorAge(used)); `devdisk sim reap --apply` removes these too"
                     } else if (used ?? Int.max) >= o.simulatorDays {
                         finding.tier = .review
                         finding.reason = "simulator \(name) (\(runtimeName)) unused for \(used.map { "\($0) days" } ?? "its whole life"); deleting loses its installed apps and data"
@@ -285,14 +319,19 @@ enum Rules {
             for (identifier, runtime) in runtimes {
                 let name = (runtime["runtimeIdentifier"] as? String)?.split(separator: ".").last.map(String.init) ?? identifier
                 let used = age(runtime["lastUsedAt"])
+                let devices = usedBy[runtime["runtimeIdentifier"] as? String ?? ""] ?? []
+                let deletable = runtime["deletable"] as? Bool == true
                 // No lastUsedAt means simctl has no record, not that the runtime is unused.
-                let stale = (used ?? 0) >= o.simulatorDays && runtime["deletable"] as? Bool == true
+                let stale = deletable && ((used ?? 0) >= o.simulatorDays || devices.isEmpty)
+                let users = devices.isEmpty ? "no simulator uses it"
+                    : "used by \(devices.count) simulator\(devices.count == 1 ? "" : "s"): "
+                      + devices.sorted().prefix(4).joined(separator: ", ") + (devices.count > 4 ? ", …" : "")
                 findings.append(Finding(
                     category: .simulators, path: runtime["path"] as? String ?? identifier,
                     bytes: (runtime["sizeBytes"] as? NSNumber)?.int64Value ?? 0, ageDays: used,
                     tier: stale ? .review : .info,
-                    reason: stale ? "simulator runtime \(name) unused for \(simulatorAge(used)); re-download is several GB"
-                                  : "simulator runtime \(name), in use",
+                    reason: stale ? "simulator runtime \(name), \(users); unused for \(simulatorAge(used)); re-download is several GB"
+                                  : "simulator runtime \(name), \(users)",
                     action: stale ? .command(["xcrun", "simctl", "runtime", "delete", identifier]) : .none))
             }
         }
@@ -361,7 +400,7 @@ enum Rules {
     }
 
     static func agents(_ o: Options) -> [Finding] {
-        fixed(o, .agents, [
+        openclaw(o) + fixed(o, .agents, [
             (".codex/sessions", .info, "Codex session transcripts"),
             (".codex/worktrees", .review, "Codex worktrees; check for unmerged work before removing"),
             (".codex/thread_history_1.sqlite", .info, "Codex thread history"),
@@ -378,6 +417,7 @@ enum Rules {
             (".lmstudio/models", .info, "LM Studio models; remove unused ones in LM Studio"),
             (".omlx/models", .info, "oMLX models"),
             (".omlx/cache", .review, "oMLX cache"),
+            ("ComfyUI-Shared", .review, "ComfyUI model weights; a re-download is tens of GB"),
             (".ollama/models", .info, "Ollama models; remove with `ollama rm`"),
             (".cache/huggingface", .info, "Hugging Face model cache; prune with `hf cache delete`"),
         ])

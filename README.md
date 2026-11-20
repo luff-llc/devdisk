@@ -56,7 +56,7 @@ everything. Tiers and ages are always computed fresh.
 | `simulators` | Simulator devices and runtimes, removed through `xcrun simctl`. |
 | `caches` | npm, bun, Gradle, Cargo, CocoaPods, Homebrew, pip, Yarn, SwiftPM, `~/.cache`. |
 | `browsers` | Chrome's leftover `code_sign_clone` copies. |
-| `agents` | Codex, Claude, Gemini and Cursor transcripts and worktrees. |
+| `agents` | Codex, Claude, Gemini and Cursor transcripts and worktrees; OpenClaw scratch files, spent runtimes, rollback snapshots and idle browser profiles. Projects under `~/.openclaw/workspace/projects` are scanned like any other root. |
 | `models` | LM Studio, oMLX, Ollama and Hugging Face model stores. |
 | `containers` | Docker, OrbStack, Colima, Lima, Android emulator images. |
 
@@ -98,6 +98,9 @@ processes and demotes a finding to `review` when:
 
 Shared download caches are also `review` until nothing has been added to them for 30 days,
 because offline builds need them and reads leave no trace.
+
+Build output is also kept out of the safe tier when a LaunchAgent runs from the same project,
+since a job on a timer is rarely running at the moment of the scan.
 
 For anything that must survive between builds, list it in `~/.config/devdisk/exclude`, one path
 or glob per line (`#` for comments, `~` for home), or pass `--exclude`. Excluded findings show
