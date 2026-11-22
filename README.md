@@ -29,8 +29,17 @@ devdisk scan --category tmp --category xcode --json
 devdisk clean --all-safe       # dry run of everything in the safe tier
 devdisk clean --all-safe --apply
 devdisk clean --path /private/tmp/old-review-clone --allow-review --apply
+devdisk status --need 4G       # room for a job writing 4 GB above pressroom's floor? if not, what to clean
+devdisk where ~ --min-size 3G  # size tree that opens every folder over 3 GB, rule or no rule
+devdisk hidden                 # in use on the volume minus everything readable: root-only space, Spotlight
+devdisk claim <path> --kind build   # mark what this session created; `devdisk finish --apply` removes it
 devdisk guide                  # conventions to paste into AGENTS.md / CLAUDE.md
 ```
+
+`where` and `hidden` answer "what is taking the space" when no rule knows about it. `hidden`
+walks the whole Data volume (a couple of minutes) and compares it with what APFS reports in
+use; the gap is space only root can read (Spotlight's index, system logs, other users), and it
+prints a `sudo du` command to size those folders. Walks never download iCloud-only files.
 
 Sizes are measured with `getattrlistbulk` (one system call per directory instead of one per
 file) and remembered for an hour in `~/.local/state/devdisk/sizes.json`. A remembered size is

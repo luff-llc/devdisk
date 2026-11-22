@@ -578,6 +578,29 @@ final class DevDiskTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: wt))
     }
 
+    func testWhereOpensLargeFoldersAndHiddenCollapses() throws {
+        try make("home/projects/big/a", file: "x.bin")
+        try make("home/projects/big/b", file: "y.bin")
+        try make("home/projects/small", file: "z.bin")
+        let root = base.appendingPathComponent("home/projects").path
+        let tree = Where.tree(root, depth: 3, open: 12 << 10)
+        let big = tree.children.first { $0.path.hasSuffix("/big") }
+        XCTAssertEqual(tree.children.first?.path, big?.path, "largest first")
+        XCTAssertEqual(big?.children.count, 2, "a folder over the threshold is opened")
+        XCTAssertEqual(tree.children.first { $0.path.hasSuffix("/small") }?.children.count, 0)
+        XCTAssertEqual(tree.bytes, tree.children.reduce(0) { $0 + $1.bytes })
+        XCTAssertEqual(Hidden.collapse(["/a/b/c", "/a/b", "/x", "/a/bc"]), ["/x", "/a/b", "/a/bc"])
+    }
+
+    func testStaleDeviceSupportNeedsReview() throws {
+        let o = try options([.xcode])
+        let old = try make("home/Library/Developer/Xcode/visionOS DeviceSupport/RealityDevice14,1 1.1.1 (21O224)", daysOld: 400)
+        let current = try make("home/Library/Developer/Xcode/iOS DeviceSupport/iPhone19,2 27.2 (24B119)", daysOld: 10)
+        let findings = Scanner.scan(o).findings
+        XCTAssertEqual(findings.first { $0.path == old }?.tier, .review, "the only set for a device, but over 180 days old")
+        XCTAssertEqual(findings.first { $0.path == current }?.tier, .info)
+    }
+
     func testFreshCachesNeedReview() throws {
         let o = try options([.caches])
         let registry = try make("home/.cargo/registry/cache/index.crates.io", daysOld: 2)

@@ -12,22 +12,34 @@ enum Walker {
         var total: Int64 = 0
         /// Subtree totals for the watched directories found under the root.
         var watched: [String: Int64] = [:]
+        /// Directories that could not be opened (permission), when asked for. Their size is unknown.
+        var unreadable: [String] = []
     }
 
     /// Sizes `root` and, in the same pass, any `watch` directories nested inside it.
-    static func measure(_ root: String, watch: Set<String> = []) -> Measurement {
+    static func measure(_ root: String, watch: Set<String> = [], recordUnreadable: Bool = false) -> Measurement {
+        _ = noDownloads
         var info = stat()
         guard lstat(root, &info) == 0 else { return Measurement() }
         guard info.st_mode & S_IFMT == S_IFDIR else {
             return Measurement(total: Int64(info.st_blocks) * 512)
         }
         let fd = open(root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-        guard fd >= 0 else { return Measurement() }
+        guard fd >= 0 else { return Measurement(unreadable: recordUnreadable ? [root] : []) }
         let pass = Pass(device: info.st_dev, watch: watch)
+        pass.recordUnreadable = recordUnreadable
         defer { pass.buffer.deallocate() }
-        let total = pass.walk(fd: fd, path: watch.isEmpty ? nil : root)
-        return Measurement(total: total, watched: pass.watched)
+        let total = pass.walk(fd: fd, path: watch.isEmpty && !recordUnreadable ? nil : root)
+        return Measurement(total: total, watched: pass.watched, unreadable: pass.unreadable)
     }
+
+    /// Cloud-only files (iCloud Drive, file providers) are placeholders that take no local space.
+    /// Opening one would make macOS download it and block the walk on the network, so the whole
+    /// process refuses to materialize them; such folders then fail to open and count as zero.
+    static let noDownloads: Void = {
+        // IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_PROCESS, IOPOL_MATERIALIZE_DATALESS_FILES_OFF
+        _ = setiopolicy_np(3, IOPOL_SCOPE_PROCESS, 1)
+    }()
 
     // Attribute bits from <sys/attr.h>, spelled out because Swift imports some as signed.
     private static let commonReturned: UInt32 = 0x8000_0000
@@ -43,6 +55,8 @@ enum Walker {
         let device: dev_t
         let watch: Set<String>
         var watched: [String: Int64] = [:]
+        var recordUnreadable = false
+        var unreadable: [String] = []
         var seenLinks: Set<UInt64> = []
         let capacity = 256 * 1024
         let buffer: UnsafeMutableRawPointer
@@ -130,8 +144,11 @@ enum Walker {
 
             for name in subdirectories {
                 let child = openat(fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
-                guard child >= 0 else { continue }
                 let childPath = path.map { $0 + "/" + name }
+                guard child >= 0 else {
+                    if recordUnreadable, errno == EACCES || errno == EPERM, let childPath { unreadable.append(childPath) }
+                    continue
+                }
                 let size = walk(fd: child, path: childPath)
                 if let childPath, watch.contains(childPath) { watched[childPath] = size }
                 total += size

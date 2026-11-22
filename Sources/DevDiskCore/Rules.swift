@@ -241,12 +241,16 @@ enum Rules {
             for (_, paths) in groups {
                 let sorted = paths.sorted { (Files.modified($0) ?? .distantPast) > (Files.modified($1) ?? .distantPast) }
                 for (index, path) in sorted.enumerated() {
+                    let age = Files.ageDays(path, now: o.now)
+                    // The newest set is kept, unless it is so old that the device has surely moved on.
+                    let stale = index == 0 && (age ?? 0) >= 180
                     findings.append(Finding(
-                        category: .xcode, path: path, ageDays: Files.ageDays(path, now: o.now),
-                        tier: index == 0 ? .info : .safe,
-                        reason: index == 0 ? "debug symbols for the device's current OS"
+                        category: .xcode, path: path, ageDays: age,
+                        tier: index == 0 ? (stale ? .review : .info) : .safe,
+                        reason: index == 0 ? (stale ? "debug symbols for this device, but \(age ?? 0) days old; it has likely updated since, and Xcode re-fetches them when it is connected"
+                                                    : "debug symbols for the device's current OS")
                                            : "debug symbols for a superseded OS; Xcode re-fetches them from the device if needed",
-                        action: index == 0 ? .none : .delete))
+                        action: index == 0 && !stale ? .none : .delete))
                 }
             }
         }

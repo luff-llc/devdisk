@@ -1,7 +1,7 @@
 import Foundation
 
 public enum DevDiskCommandLine {
-    public static let version = "0.6.0"
+    public static let version = "0.7.0"
 
     static let usage = """
     devdisk \(version): explain and reclaim disk space used by local development
@@ -13,6 +13,10 @@ public enum DevDiskCommandLine {
       devdisk scan   [filters] [--json]       list what is using space, by category and tier
       devdisk clean  <selection> [--apply]    remove findings; a dry run unless --apply is given
       devdisk sim    <status|acquire|release|reap>   shared simulator pool; see `devdisk sim help`
+      devdisk where [path] [--depth 4] [--min-size 2G] [--json]   size tree of a folder (default home),
+                                              opening every part over --min-size, rule or no rule
+      devdisk hidden [--json]                 space no scan can see: in use on the volume minus everything
+                                              readable, the root-only folders behind the gap, Spotlight's state
       devdisk claim <path>... [--kind build|scratch|worktree]   mark what this session created
       devdisk finish [--apply]                remove what this session claimed; see `devdisk claim help`
       devdisk guide                           conventions for coding agents (paste into AGENTS.md)
@@ -56,7 +60,7 @@ public enum DevDiskCommandLine {
         var options = Options()
         var request = CleanRequest()
         var json = false, top = 40, allSafe = false, useCache = true
-        var need: Int64?, floor: Int64?
+        var need: Int64?, floor: Int64?, whereDepth = 4
         var categories: Set<Category> = []
         var roots: [URL] = []
         var excludes: [String] = []
@@ -94,6 +98,9 @@ public enum DevDiskCommandLine {
             case "--exclude":
                 guard let raw = value() else { return fail("--exclude needs a path or glob") }
                 excludes.append(expandTilde(raw, home: options.home))
+            case "--depth":
+                guard let n = value().flatMap(Int.init), n > 0 else { return fail("--depth needs a number") }
+                whereDepth = n
             case "--need":
                 guard let bytes = value().flatMap(parseBytes) else { return fail("--need needs a size such as 4G") }
                 need = bytes
@@ -107,7 +114,12 @@ public enum DevDiskCommandLine {
             case "--top":
                 guard let count = value().flatMap(Int.init) else { return fail("--top needs a number") }
                 top = count
-            default: return fail("unknown option \(flag); run `devdisk help`")
+            default:
+                if command == "where", !flag.hasPrefix("-") {
+                    request.paths.append(expandTilde(flag, home: options.home))
+                    continue
+                }
+                return fail("unknown option \(flag); run `devdisk help`")
             }
         }
         if !roots.isEmpty { options.roots = roots }
@@ -132,6 +144,18 @@ public enum DevDiskCommandLine {
             }
             if json { emit(plan) } else { printRoom(plan, status) }
             return plan.enough ? 0 : 3
+        case "where":
+            let root = request.paths.first ?? args.first ?? options.home.path
+            let minimum = options.minBytes == 100 << 20 ? Int64(2) << 30 : options.minBytes
+            let node = Where.tree(root, depth: whereDepth, open: minimum)
+            if json { emit(node) } else {
+                var lines: [String] = []
+                Where.print(node, minimum: minimum, out: &lines)
+                Swift.print(lines.joined(separator: "\n"))
+            }
+        case "hidden":
+            let report = Hidden.report()
+            if json { emit(report) } else { printHidden(report) }
         case "scan":
             if !categories.isEmpty { options.categories = categories }
             let report = Scanner.scan(options)
@@ -191,6 +215,28 @@ public enum DevDiskCommandLine {
         print("\nScanned in \(report.seconds)s\(report.sizesFromCache > 0 ? ", \(report.sizesFromCache) sizes reused from the last hour (--no-cache to re-measure)" : "").")
         print("TOTAL  safe \(total("safe"))   review \(total("review"))   info \(total("info"))")
         print("Reclaim the safe tier with `devdisk clean --all-safe` (dry run), then add --apply.")
+    }
+
+    static func printHidden(_ r: HiddenReport) {
+        print("\(r.volume): \(formatBytes(r.inUseBytes)) in use, \(formatBytes(r.measuredBytes)) readable by you, gap \(formatBytes(max(0, r.gapBytes))) (\(r.seconds)s)")
+        print("The gap is a lower bound: copies that share disk blocks are counted in full on the readable side.\n")
+        print("Largest top-level folders (readable part):")
+        for folder in r.folders.prefix(10) {
+            let note = folder.unreadable.isEmpty ? "" : "  + \(folder.unreadable.count) folder(s) you cannot open"
+            print("  \(formatBytes(folder.measuredBytes).padding(toLength: 8, withPad: " ", startingAt: 0)) \(folder.path)\(note)")
+        }
+        print("\nSpotlight:")
+        for (volume, state) in r.spotlight.volumes.sorted(by: { $0.key < $1.key }) { print("  \(volume): \(state)") }
+        print("  index server (mds_stores): \(formatBytes(r.spotlight.storesResidentBytes)) memory, \(String(format: "%.1f", r.spotlight.storesCPUPercent))% CPU")
+        print("  per-app indexes in ~/Library/Metadata/CoreSpotlight: \(formatBytes(r.spotlight.appIndexesBytes))")
+        print("\nLocal snapshots: \(r.snapshots.isEmpty ? "none" : r.snapshots.joined(separator: ", "))")
+        if !r.suspects.isEmpty {
+            print("\nRoot-only folders that commonly hide space:")
+            for s in r.suspects { print("  \(s.path)\n      \(s.what)\n      fix: \(s.fix)") }
+        }
+        if !r.measureCommand.isEmpty {
+            print("\nTo size the unreadable folders, run this yourself (it asks for your password):\n  \(r.measureCommand)")
+        }
     }
 
     static func printRoom(_ plan: RoomPlan, _ status: VolumeStatus) {
