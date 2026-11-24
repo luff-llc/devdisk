@@ -1,7 +1,7 @@
 import Foundation
 
 public enum DevDiskCommandLine {
-    public static let version = "0.7.0"
+    public static let version = "0.8.0"
 
     static let usage = """
     devdisk \(version): explain and reclaim disk space used by local development
@@ -18,7 +18,10 @@ public enum DevDiskCommandLine {
       devdisk hidden [--json]                 space no scan can see: in use on the volume minus everything
                                               readable, the root-only folders behind the gap, Spotlight's state
       devdisk claim <path>... [--kind build|scratch|worktree]   mark what this session created
-      devdisk finish [--apply]                remove what this session claimed; see `devdisk claim help`
+      devdisk release <path>...               give up claimed paths now (a finished worktree)
+      devdisk finish [--scope NAME | --all] [--apply]   remove what this session claimed; see `devdisk claim help`
+      devdisk sweep [--apply] [--install | --uninstall]   prune pressroom lanes of builds nothing needs;
+                                              --install runs it hourly from a LaunchAgent
       devdisk guide                           conventions for coding agents (paste into AGENTS.md)
 
     FILTERS (scan and clean)
@@ -53,9 +56,10 @@ public enum DevDiskCommandLine {
             return 0
         }
         if command == "sim" { return SimCommand.run(Array(arguments.dropFirst())) }
-        if ["claim", "claims", "unclaim", "finish"].contains(command) {
+        if ["claim", "claims", "unclaim", "finish", "release"].contains(command) {
             return ClaimCommand.run(command, Array(arguments.dropFirst()))
         }
+        if command == "sweep" { return SweepCommand.run(Array(arguments.dropFirst())) }
         var args = Array(arguments.dropFirst())
         var options = Options()
         var request = CleanRequest()

@@ -555,6 +555,40 @@ final class DevDiskTests: XCTestCase {
         XCTAssertEqual(Claims.live(store).map(\.owner), ["b"], "the finished owner's claims are dropped")
     }
 
+    func testSubagentFinishesOnlyItsScopeAndReleaseGivesUpOnePath() throws {
+        var o = try options([.tmp])
+        o.pressroom = PressroomLeases()
+        let store = LeaseStore(url: base.appendingPathComponent("home/.local/state/devdisk/leases.json"))
+        // One session id, shared by the session and its subagent.
+        let parents = try make("tmp/parent-worktree-build", daysOld: 0)
+        let subagents = try make("tmp/subagent-build", daysOld: 0)
+        let done = try make("tmp/parent-done-build", daysOld: 0)
+        Claims.claim([parents, done], kind: .build, owner: "claude:s", ttl: 3600, store: store)
+        Claims.claim([subagents], kind: .build, owner: "claude:s", ttl: 3600, store: store, scope: "explore")
+
+        var handed: [String] = []
+        let sub = Claims.finish(owner: "claude:s", apply: true, options: o, store: store, activity: Activity(),
+                                selection: .scope("explore"), afterRemoval: { handed += $0 })
+        XCTAssertEqual(sub.map(\.path), [Claims.resolve(subagents)])
+        XCTAssertFalse(fm.fileExists(atPath: subagents))
+        XCTAssertTrue(fm.fileExists(atPath: parents), "the subagent's finish leaves its parent's claims")
+        XCTAssertEqual(handed, [Claims.resolve(subagents)], "removed folders go to pressroom prune")
+        XCTAssertEqual(Set(Claims.live(store).map(\.id)), Set([parents, done].map(Claims.resolve)))
+
+        let released = Claims.finish(owner: "claude:s", apply: true, options: o, store: store, activity: Activity(),
+                                     selection: .paths([done]))
+        XCTAssertEqual(released.map(\.outcome), ["removed"])
+        XCTAssertFalse(fm.fileExists(atPath: done))
+        XCTAssertEqual(Claims.live(store).map(\.id), [Claims.resolve(parents)], "release drops only that claim")
+    }
+
+    func testSweepAgentRunsSweepApply() {
+        let plist = SweepCommand.agentPlist(program: "/opt/homebrew/bin/devdisk", every: 3600, log: "/tmp/x.log")
+        XCTAssertNotNil(try? PropertyListSerialization.propertyList(from: Data(plist.utf8), format: nil))
+        XCTAssertTrue(plist.contains("<string>sweep</string><string>--apply</string>"))
+        XCTAssertTrue(plist.contains("<integer>3600</integer>"))
+    }
+
     func testFinishKeepsDirtyWorktree() throws {
         var o = try options([.tmp])
         o.pressroom = PressroomLeases()
