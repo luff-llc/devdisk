@@ -105,9 +105,37 @@ enum Rules {
         }
     }
 
+    /// Folders that look like build output but hold state nothing rebuilds: `wrangler dev`'s
+    /// local databases, and test results a project keeps.
+    static func neverOffered(_ name: String) -> String? {
+        if name == ".wrangler" { return "local state of `wrangler dev` (its D1, KV and R2 data); never offered" }
+        if name.hasSuffix(".xcresult") { return "Xcode test results kept by the project; re-running the tests would make different ones; never offered" }
+        return nil
+    }
+
+    static let lockfiles = ["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock"]
+
+    /// The lockfile that pins a `node_modules` in `dir`: beside it, or at the workspace root above it.
+    static func lockfile(for dir: String, within root: String) -> String? {
+        var current = dir
+        while true {
+            if let found = lockfiles.first(where: { FileManager.default.fileExists(atPath: current + "/" + $0) }) {
+                return current + "/" + found
+            }
+            if current == root || FileManager.default.fileExists(atPath: current + "/.git") { return nil }
+            let parent = (current as NSString).deletingLastPathComponent
+            if parent == current || !Files.contains(root, parent) { return nil }
+            current = parent
+        }
+    }
+
     /// Findings if `path` is a build artifact, none if it is an ordinary directory to descend into.
     private static func classify(_ path: String, in dir: String, _ o: Options) -> [Finding] {
         let name = (path as NSString).lastPathComponent
+        if let why = neverOffered(name) {
+            return [Finding(category: .artifacts, path: path, ageDays: Files.ageDays(path, now: o.now), tier: .info,
+                            reason: why, action: .none)]
+        }
         if ignoredOutputNames.contains(name) {
             guard gitIgnores(path, in: dir) else { return [] }
             return splitOutput(path, o) ?? [Finding(
@@ -130,6 +158,14 @@ enum Rules {
             return Finding(
                 category: .artifacts, path: path, ageDays: Files.ageDays(path, now: o.now), tier: .review,
                 reason: "build output that also holds Solana program keypairs in target/deploy; back them up first",
+                action: .delete)
+        }
+        // Without a lockfile a reinstall resolves every version afresh: not the same tree.
+        if regenerable, name == "node_modules",
+           lockfile(for: dir, within: o.roots.map(\.path).first { Files.contains($0, dir) } ?? dir) == nil {
+            return Finding(
+                category: .artifacts, path: path, ageDays: Files.ageDays(path, now: o.now), tier: .review,
+                reason: "node_modules with no lockfile beside it or above it; a reinstall may not give the same versions",
                 action: .delete)
         }
         if regenerable {
@@ -282,6 +318,14 @@ enum Rules {
         func age(_ value: Any?) -> Int? {
             (value as? String).flatMap(iso.date).map { max(0, Int(o.now.timeIntervalSince($0) / 86400)) }
         }
+        // Simulators named after their device type ("iPhone 17") belong to no project: Xcode
+        // made them, and they grow. Erasing keeps the simulator for whoever runs it by name.
+        var stockNames: Set<String> = []
+        if let data = Shell.run("xcrun", ["simctl", "list", "devicetypes", "-j"]).output.data(using: .utf8),
+           let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let types = root["devicetypes"] as? [[String: Any]] {
+            stockNames = Set(types.compactMap { $0["name"] as? String })
+        }
         if let data = Shell.run("xcrun", ["simctl", "list", "devices", "-j"]).output.data(using: .utf8),
            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let runtimes = root["devices"] as? [String: [[String: Any]]] {
@@ -308,6 +352,11 @@ enum Rules {
                               (used ?? Int.max) >= Int(limits.tempAge / 86400) {
                         finding.tier = .safe
                         finding.reason = "temporary simulator \(name) (\(runtimeName)) unused for \(simulatorAge(used)); `devdisk sim reap --apply` removes these too"
+                    } else if !leased.contains(udid), device["state"] as? String == "Shutdown",
+                              stockNames.contains(name), (used ?? Int.max) >= 1 {
+                        finding.tier = .review
+                        finding.reason = "stock simulator \(name) (\(runtimeName)), unused for \(simulatorAge(used)); erasing empties it and keeps it for projects that run it by name"
+                        finding.action = .command(["xcrun", "simctl", "erase", udid])
                     } else if (used ?? Int.max) >= o.simulatorDays {
                         finding.tier = .review
                         finding.reason = "simulator \(name) (\(runtimeName)) unused for \(used.map { "\($0) days" } ?? "its whole life"); deleting loses its installed apps and data"
@@ -315,6 +364,7 @@ enum Rules {
                         finding.action = .none
                     }
                     findings.append(finding)
+                    if device["state"] as? String == "Shutdown" { findings += wallpaperCaches(dataPath, name: name, o) }
                 }
             }
         }
@@ -340,6 +390,25 @@ enum Rules {
             }
         }
         return findings
+    }
+
+    /// iOS writes a wallpaper snapshot on every boot and appearance change and deletes none.
+    /// A cache: iOS draws the wallpaper again on the next boot. Only on a shut-down simulator.
+    static func wallpaperCaches(_ dataPath: String, name: String, _ o: Options) -> [Finding] {
+        let store = dataPath + "/Library/Application Support/PRBPosterExtensionDataStore"
+        guard isDirectory(store),
+              let walker = FileManager.default.enumerator(atPath: store) else { return [] }
+        var found: [Finding] = []
+        while let relative = walker.nextObject() as? String {
+            if walker.level > 8 { walker.skipDescendants(); continue }
+            guard (relative as NSString).lastPathComponent == "SnapshotCache.cachedb" else { continue }
+            walker.skipDescendants()
+            let path = store + "/" + relative
+            found.append(Finding(category: .simulators, path: path, ageDays: Files.ageDays(path, now: o.now), tier: .safe,
+                                 reason: "wallpaper snapshots in shut-down simulator \(name); iOS never prunes them and redraws the wallpaper on next boot",
+                                 action: .delete))
+        }
+        return found
     }
 
     private static func simulatorAge(_ days: Int?) -> String { days.map { "\($0) days" } ?? "its whole life" }
@@ -390,6 +459,17 @@ enum Rules {
                     reason: live ? "code-sign clone used by the running Chrome" : "leftover Chrome code-sign clone from an earlier launch",
                     action: live ? .none : .delete))
             }
+        }
+        let model = o.home.path + "/Library/Application Support/Google/Chrome/OptGuideOnDeviceModel"
+        if isDirectory(model) {
+            let stopped = Shell.run("/usr/bin/defaults", ["read", "com.google.Chrome", "GenAILocalFoundationalModelSettings"])
+                .output.trimmingCharacters(in: .whitespacesAndNewlines) == "1"
+            findings.append(Finding(
+                category: .browsers, path: model, ageDays: Files.ageDays(model, now: o.now), tier: .review,
+                reason: stopped
+                    ? "Chrome's on-device AI model; the policy that stops its download is set, so it stays gone"
+                    : "Chrome's on-device AI model; Chrome downloads it again unless `defaults write com.google.Chrome GenAILocalFoundationalModelSettings -int 1` is set first (turns off Chrome's built-in AI), then Chrome is restarted",
+                action: chromeRunning ? .none : .delete))
         }
         return findings
     }

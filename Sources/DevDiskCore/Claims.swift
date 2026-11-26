@@ -42,12 +42,12 @@ public enum Claims {
     /// Claims (or renews) `paths` for `owner`. Paths are resolved, so /tmp and /private/tmp match.
     @discardableResult
     public static func claim(_ paths: [String], kind: ClaimKind, owner: String, ttl: TimeInterval,
-                             store: LeaseStore, now: Date = Date()) -> [Lease] {
+                             store: LeaseStore, scope: String? = nil, now: Date = Date()) -> [Lease] {
         let resolved = paths.map(resolve)
         return store.mutate { leases in
             leases.removeAll { $0.kind.hasPrefix(prefix) && resolved.contains($0.id) && $0.owner == owner }
             let added = resolved.map { Lease(owner: owner, kind: prefix + kind.rawValue, id: $0, createdAt: now,
-                                             expiresAt: now.addingTimeInterval(ttl)) }
+                                             expiresAt: now.addingTimeInterval(ttl), scope: scope) }
             leases += added
             return added
         }
@@ -71,11 +71,28 @@ public enum Claims {
     /// Removes what `owner` claimed: build and scratch paths outright, worktrees only when git says
     /// nothing would be lost. A path that is excluded, leased in pressroom, claimed by someone else,
     /// or still in use is kept. The owner's claims are dropped afterwards, including on paths kept.
-    public static func finish(owner: String, apply: Bool, options o: Options, store: LeaseStore,
-                              activity: Activity? = nil) -> [FinishResult] {
-        let mine = live(store).filter { $0.owner == owner } + store.read().filter {
-            $0.kind.hasPrefix(prefix) && $0.owner == owner && $0.expiresAt <= o.now
+    /// Which of an owner's claims `finish` takes: all of them (the session ending), one
+    /// scope's (a subagent's), or the claims on some paths (`release`).
+    public enum Selection: Sendable {
+        case all
+        case scope(String)
+        case paths([String])
+
+        func takes(_ claim: Lease) -> Bool {
+            switch self {
+            case .all: return true
+            case .scope(let scope): return claim.scope == scope
+            case .paths(let paths): return paths.map(Claims.resolve).contains(claim.id)
+            }
         }
+    }
+
+    public static func finish(owner: String, apply: Bool, options o: Options, store: LeaseStore,
+                              activity: Activity? = nil, selection: Selection = .all,
+                              afterRemoval: (([String]) -> Void)? = nil) -> [FinishResult] {
+        let mine = (live(store).filter { $0.owner == owner } + store.read().filter {
+            $0.kind.hasPrefix(prefix) && $0.owner == owner && $0.expiresAt <= o.now
+        }).filter(selection.takes)
         let others = live(store).filter { $0.owner != owner }
         let pressroom = o.pressroom ?? PressroomLeases.load(from: PressroomLeases.folder(home: o.home))
         let index = Protection.InUseIndex(activity ?? o.activity ?? Activity.current(home: o.home))
@@ -115,8 +132,32 @@ public enum Claims {
                 result("failed", error.localizedDescription)
             }
         }
-        if apply { _ = release(owner: owner, paths: nil, store: store) }
+        if apply {
+            let ids = mine.map(\.id)
+            _ = store.mutate { leases in leases.removeAll { $0.kind.hasPrefix(prefix) && $0.owner == owner && ids.contains($0.id) } }
+            // What was built from the removed folders is no use to anyone now (pressroom rule 33).
+            let removed = results.filter { $0.outcome == "removed" }.map(\.path)
+            if !removed.isEmpty { afterRemoval?(removed) }
+        }
         return results
+    }
+
+    /// Hands removed folders to `pressroom prune --origin`, so their builds leave the lanes.
+    /// Started and not waited for: pruning a big lane can outlast a session-end hook.
+    public static func pruneLanes(for removed: [String]) {
+        guard let tool = Rules.pressroomTool() else { return }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = ["prune", "--apply", "--holder", "devdisk"] + removed.flatMap { ["--origin", $0] }
+        let log = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/devdisk-sweep.log")
+        if !FileManager.default.fileExists(atPath: log.path) { FileManager.default.createFile(atPath: log.path, contents: nil) }
+        if let handle = try? FileHandle(forWritingTo: log) {
+            handle.seekToEndOfFile()
+            process.standardOutput = handle
+            process.standardError = handle
+        }
+        process.standardInput = FileHandle.nullDevice
+        try? process.run()
     }
 
     static func resolve(_ path: String) -> String {
@@ -129,15 +170,21 @@ public enum Claims {
 /// `devdisk claim`, `devdisk claims`, `devdisk unclaim`, `devdisk finish`.
 enum ClaimCommand {
     static let usage = """
-    devdisk claim <path>... [--kind build|scratch|worktree] [--owner ID] [--ttl 7d]
+    devdisk claim <path>... [--kind build|scratch|worktree] [--owner ID] [--scope NAME] [--ttl 7d]
         Mark paths this session created. Other sessions' cleanup leaves them alone until the claim
         ends; `finish` removes them. The owner defaults to $DEVDISK_OWNER or the agent session id.
+        A subagent shares its session's id: it claims with --scope (or $DEVDISK_SCOPE), and
+        finishes only that scope.
     devdisk claims [--owner ID] [--json]       list live claims
     devdisk unclaim [<path>...] [--owner ID]   drop claims, removing nothing
-    devdisk finish [--owner ID | --hook] [--apply] [--json]
+    devdisk release <path>... [--owner ID] [--json]
+        Give up claimed paths now, mid-session: remove them as finish would, and drop their claims.
+    devdisk finish [--owner ID | --hook] [--scope NAME | --all] [--apply] [--json]
         Remove what the owner claimed: build and scratch folders, and worktrees that are clean and
-        merged or pushed. A dry run unless --apply. --hook reads the owner from a Claude Code hook's
-        JSON on standard input (SessionEnd), so it can run when a session ends.
+        merged or pushed. A dry run unless --apply. With --apply it needs --scope (one scope's
+        claims) or --all (every claim of the session, its subagents' too), except with --hook,
+        which reads the owner from a Claude Code hook's JSON on standard input (SessionEnd).
+        Builds made from what it removes are pruned from pressroom's lanes afterwards.
     """
 
     static func run(_ command: String, _ arguments: [String], store: LeaseStore = LeaseStore()) -> Int32 {
@@ -145,6 +192,8 @@ enum ClaimCommand {
         var paths: [String] = []
         var owner = Claims.defaultOwner()
         var kind = ClaimKind.build, ttl = Claims.defaultTTL, apply = false, json = false, hook = false
+        var scope = ProcessInfo.processInfo.environment["DEVDISK_SCOPE"].flatMap { $0.isEmpty ? nil : $0 }
+        var all = false
         let home = FileManager.default.homeDirectoryForCurrentUser
         func fail(_ message: String) -> Int32 {
             FileHandle.standardError.write(Data("devdisk: \(message)\n".utf8))
@@ -161,6 +210,10 @@ enum ClaimCommand {
             case "--ttl":
                 guard let parsed = value().flatMap(parseDuration) else { return fail("--ttl needs a duration such as 7d") }
                 ttl = parsed
+            case "--scope":
+                guard let raw = value(), !raw.isEmpty else { return fail("--scope needs a name") }
+                scope = raw
+            case "--all": all = true
             case "--apply": apply = true
             case "--json": json = true
             case "--hook": hook = true
@@ -186,7 +239,7 @@ enum ClaimCommand {
             guard let owner else { return fail("no owner: pass --owner or set DEVDISK_OWNER") }
             guard !paths.isEmpty else { return fail("claim needs at least one path") }
             for path in paths where !FileManager.default.fileExists(atPath: path) { return fail("\(path) does not exist") }
-            let added = Claims.claim(paths, kind: kind, owner: owner, ttl: ttl, store: store)
+            let added = Claims.claim(paths, kind: kind, owner: owner, ttl: ttl, store: store, scope: scope)
             if json { print(String(decoding: (try? encoder.encode(added)) ?? Data(), as: UTF8.self)) }
             else { for lease in added { print("claimed \(lease.id) (\(kind.rawValue)) for \(owner) until \(ISO8601DateFormatter().string(from: lease.expiresAt))") } }
         case "claims":
@@ -197,13 +250,32 @@ enum ClaimCommand {
         case "unclaim":
             guard let owner else { return fail("no owner: pass --owner or set DEVDISK_OWNER") }
             print("dropped \(Claims.release(owner: owner, paths: paths.isEmpty ? nil : paths, store: store)) claim(s)")
-        case "finish":
+        case "finish", "release":
             guard let owner else { return fail("no owner: pass --owner, --hook, or set DEVDISK_OWNER") }
+            let selection: Claims.Selection
+            if command == "release" {
+                guard !paths.isEmpty else { return fail("release needs the claimed paths to give up") }
+                selection = .paths(paths)
+                apply = true
+            } else if hook || all {
+                selection = .all
+            } else if let scope {
+                selection = .scope(scope)
+            } else if apply {
+                return fail("""
+                finish --apply would end every claim of \(owner), and a subagent shares its session's id. \
+                Pass --scope NAME for the claims made with that scope, --all from the session itself, or \
+                give up one path with devdisk release PATH.
+                """)
+            } else {
+                selection = .all
+            }
             var options = Options()
             options.excludes = Protection.loadExcludes(home: options.home)
-            let results = Claims.finish(owner: owner, apply: apply, options: options, store: store)
+            let results = Claims.finish(owner: owner, apply: apply, options: options, store: store,
+                                        selection: selection, afterRemoval: Claims.pruneLanes)
             if json { print(String(decoding: (try? encoder.encode(results)) ?? Data(), as: UTF8.self)) }
-            else if results.isEmpty { if !hook { print("nothing claimed by \(owner)") } }
+            else if results.isEmpty { if !hook { print(command == "release" ? "none of those is claimed by \(owner)" : "nothing claimed by \(owner)") } }
             else { for r in results { print("\(r.outcome)\t\(r.kind.rawValue)\t\(r.path)\t\(r.detail)") } }
         default:
             print(usage)

@@ -28,6 +28,8 @@ enum Guide {
     - Claim every scratch clone, build folder and worktree right after creating it:
       `devdisk claim <path> --kind scratch|build|worktree`. Your session id is the owner. While the
       claim lives (7 days, renewed by claiming again), no other session's cleanup touches it.
+    - A subagent shares its session's id. As a subagent, claim with `--scope <your task>` and
+      finish with `devdisk finish --scope <your task> --apply`, never `--all`.
 
     Simulators (each booted one runs hundreds of processes and tens of GB of memory):
     - Never run `xcrun simctl create` or boot a simulator directly. Get one with
@@ -40,11 +42,20 @@ enum Guide {
     - Add `--erase` on release if you installed test data the next owner should not see.
 
     When the task is done:
-    - Run `devdisk finish --apply`. It removes what you claimed: build and scratch folders, and
-      worktrees that are clean and merged or pushed (others are kept and listed). You know they are
-      finished; no later tool can know that as cheaply. A SessionEnd hook may also run it for you.
+    - Give up each worktree as soon as it is merged: `devdisk release <path>`. Mid-session is fine.
+    - At the end of the session itself, run `devdisk finish --all --apply` (a subagent: `--scope`).
+      It removes what you claimed: build and scratch folders, and worktrees that are clean and
+      merged or pushed (others are kept and listed). You know they are finished; no later tool can
+      know that as cheaply. A SessionEnd hook may also run it for you. Whatever it removes, its
+      builds are then pruned from pressroom's lanes.
     - Release what you hold: `devdisk sim release --owner <id>`, `pressroom lease release <id>`.
     - Keep evidence small: keep logs, screenshots and reports, not the build tree that produced them.
+
+    Builds that stay small:
+    - Build Xcode projects into one git-ignored folder in the project:
+      `xcodebuild … -derivedDataPath DerivedData.noindex`. The `.noindex` ending keeps Spotlight out.
+    - Reuse one named simulator per project and shut it down after each task; erase it rather than
+      creating another.
 
     Protecting work in progress:
     - devdisk never calls something safe while a process is working inside it, names it on its

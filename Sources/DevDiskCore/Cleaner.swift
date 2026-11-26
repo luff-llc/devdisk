@@ -85,6 +85,27 @@ public enum Cleaner {
     }
 
     /// Last line of defence: direct deletes must stay strictly inside home or a temp directory.
+    /// After a clean: repositories where a tracked file now shows as deleted, with a few names.
+    /// A rule that takes something git tracks is wrong, whatever it was.
+    public static func trackedDeletions(_ results: [CleanResult]) -> [String] {
+        var repos: Set<String> = []
+        for result in results where result.outcome == "removed" {
+            var dir = (result.path as NSString).deletingLastPathComponent
+            while !dir.isEmpty, dir != "/", !FileManager.default.fileExists(atPath: dir) {
+                dir = (dir as NSString).deletingLastPathComponent
+            }
+            let top = Shell.run("git", ["-C", dir, "rev-parse", "--show-toplevel"], timeout: 10)
+            if top.status == 0 { repos.insert(top.output.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        }
+        return repos.sorted().compactMap { repo in
+            let status = Shell.run("git", ["--no-optional-locks", "-C", repo, "status", "--porcelain"], timeout: 30).output
+            let deleted = status.split(separator: "\n").filter { $0.hasPrefix(" D") || $0.hasPrefix("D ") }
+            guard !deleted.isEmpty else { return nil }
+            let names = deleted.prefix(3).map { String($0.dropFirst(3)) }.joined(separator: ", ")
+            return "\(repo): \(deleted.count) tracked file\(deleted.count == 1 ? "" : "s") now deleted (\(names)); restore with git restore"
+        }
+    }
+
     static func refusal(_ finding: Finding, _ o: Options) -> String? {
         guard finding.action == .delete else { return nil }
         // Not standardized: Foundation would strip /private and break the prefix comparison.

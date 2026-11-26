@@ -11,13 +11,17 @@ public struct Lease: Codable, Equatable, Sendable {
     public var id: String
     public var createdAt: Date
     public var expiresAt: Date
+    /// For claims: the part of the session that made it (`--scope`), so a subagent that
+    /// shares its parent's session id finishes only its own.
+    public var scope: String?
 
-    public init(owner: String, kind: String, id: String, createdAt: Date, expiresAt: Date) {
+    public init(owner: String, kind: String, id: String, createdAt: Date, expiresAt: Date, scope: String? = nil) {
         self.owner = owner
         self.kind = kind
         self.id = id
         self.createdAt = createdAt
         self.expiresAt = expiresAt
+        self.scope = scope
     }
 }
 

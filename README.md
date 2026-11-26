@@ -32,7 +32,9 @@ devdisk clean --path /private/tmp/old-review-clone --allow-review --apply
 devdisk status --need 4G       # room for a job writing 4 GB above pressroom's floor? if not, what to clean
 devdisk where ~ --min-size 3G  # size tree that opens every folder over 3 GB, rule or no rule
 devdisk hidden                 # in use on the volume minus everything readable: root-only space, Spotlight
-devdisk claim <path> --kind build   # mark what this session created; `devdisk finish --apply` removes it
+devdisk claim <path> --kind build   # mark what this session created; `devdisk finish --all --apply` removes it
+devdisk release <path>         # give up one claimed worktree now; its builds leave pressroom's lanes
+devdisk sweep                  # what `pressroom prune` would take from the build lanes; --install runs it hourly
 devdisk guide                  # conventions to paste into AGENTS.md / CLAUDE.md
 ```
 
