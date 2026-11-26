@@ -18,9 +18,13 @@ final class DevDiskTests: XCTestCase {
 
     /// Creates a directory holding one file, with both dated `daysOld` days in the past.
     @discardableResult
-    private func make(_ relative: String, daysOld: Int = 0, file: String = "data.bin") throws -> String {
+    /// A folder with one file in it. A `node_modules` gets a lockfile beside it unless `lockfile` is false.
+    private func make(_ relative: String, daysOld: Int = 0, file: String = "data.bin", lockfile: Bool = true) throws -> String {
         let dir = base.appendingPathComponent(relative)
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        if lockfile, dir.lastPathComponent == "node_modules" {
+            fm.createFile(atPath: dir.deletingLastPathComponent().appendingPathComponent("package-lock.json").path, contents: Data("{}".utf8))
+        }
         let filePath = dir.appendingPathComponent(file).path
         fm.createFile(atPath: filePath, contents: Data(count: 8192))
         let date = Date().addingTimeInterval(-Double(daysOld) * 86400)
@@ -587,6 +591,58 @@ final class DevDiskTests: XCTestCase {
         XCTAssertNotNil(try? PropertyListSerialization.propertyList(from: Data(plist.utf8), format: nil))
         XCTAssertTrue(plist.contains("<string>sweep</string><string>--apply</string>"))
         XCTAssertTrue(plist.contains("<integer>3600</integer>"))
+    }
+
+    func testNodeModulesWithoutALockfileNeedsReview() throws {
+        let o = try options([.artifacts])
+        let pinned = try make("home/projects/web/node_modules", daysOld: 30)
+        try make("home/projects/web", file: "package-lock.json")
+        let loose = try make("home/projects/sketch/node_modules", daysOld: 30, lockfile: false)
+        try make("home/projects/sketch", file: "package.json")
+        // A package in a workspace: the lockfile is at the workspace root.
+        try make("home/projects/mono", file: "pnpm-lock.yaml")
+        let member = try make("home/projects/mono/packages/app/node_modules", daysOld: 30, lockfile: false)
+        let findings = Scanner.scan(o).findings
+        XCTAssertEqual(findings.first { $0.path == pinned }?.tier, .safe)
+        XCTAssertEqual(findings.first { $0.path == loose }?.tier, .review, "no lockfile: a reinstall may differ")
+        XCTAssertEqual(findings.first { $0.path == member }?.tier, .safe, "the workspace's lockfile pins it")
+    }
+
+    func testWranglerStateAndTestResultsAreNeverOffered() throws {
+        let o = try options([.artifacts])
+        let wrangler = try make("home/projects/worker/.wrangler", daysOld: 60)
+        let results = try make("home/projects/app/Tests.xcresult", daysOld: 60)
+        let inside = try make("home/projects/worker/.wrangler/tmp/node_modules", daysOld: 60)
+        let findings = Scanner.scan(o).findings
+        XCTAssertEqual(findings.first { $0.path == wrangler }?.tier, .info)
+        XCTAssertEqual(findings.first { $0.path == results }?.tier, .info)
+        XCTAssertNil(findings.first { $0.path == inside }, "nothing inside is looked at")
+    }
+
+    func testWallpaperSnapshotsInAShutDownSimulator() throws {
+        let o = try options([.simulators])
+        let data = try make("home/sim/UDID/data", daysOld: 0)
+        let cache = try make("home/sim/UDID/data/Library/Application Support/PRBPosterExtensionDataStore/61/Extensions/x/descriptors/y/SnapshotCache.cachedb", daysOld: 0)
+        try make("home/sim/UDID/data/Library/Application Support/PRBPosterExtensionDataStore/61/Extensions/x/descriptors/y/SnapshotCache.cachedb", file: "snap.heic")
+        let found = Rules.wallpaperCaches(data, name: "iPhone 17", o)
+        XCTAssertEqual(found.map(\.path), [cache])
+        XCTAssertEqual(found.first?.tier, .safe)
+        XCTAssertTrue(Rules.wallpaperCaches(base.appendingPathComponent("home/none").path, name: "x", o).isEmpty)
+    }
+
+    func testCleanReportsTrackedFilesItDeleted() throws {
+        let repo = base.appendingPathComponent("home/projects/tracked").path
+        try fm.createDirectory(atPath: repo + "/build", withIntermediateDirectories: true)
+        try "x".write(toFile: repo + "/build/kept.txt", atomically: true, encoding: .utf8)
+        git("init", "-q", "-b", "main", in: repo)
+        git("add", "build/kept.txt", in: repo)
+        git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "init", in: repo)
+        try fm.removeItem(atPath: repo + "/build")
+        let removed = CleanResult(path: repo + "/build", bytes: 1, tier: .safe, outcome: "removed", detail: "")
+        let warnings = Cleaner.trackedDeletions([removed])
+        XCTAssertEqual(warnings.count, 1)
+        XCTAssertTrue(warnings[0].contains("build/kept.txt"), warnings[0])
+        XCTAssertTrue(Cleaner.trackedDeletions([CleanResult(path: repo + "/build", bytes: 1, tier: .safe, outcome: "would-remove", detail: "")]).isEmpty)
     }
 
     func testFinishKeepsDirtyWorktree() throws {

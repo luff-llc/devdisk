@@ -275,7 +275,12 @@ public enum DevDiskCommandLine {
         let bytes = results.filter { $0.outcome == (apply ? "removed" : "would-remove") }.reduce(Int64(0)) { $0 + $1.bytes }
         if apply {
             let after = VolumeStatus.read()
-            print("\nRemoved \(formatBytes(bytes)). Free space: \(formatBytes(before.freeBytes)) -> \(formatBytes(after.freeBytes)) (APFS may take a moment to report it).")
+            print("\nRemoved \(formatBytes(bytes)). Free space: \(formatBytes(before.freeBytes)) -> \(formatBytes(after.freeBytes)). APFS can take minutes to report freed space; check again with `devdisk status`.")
+            let deleted = Cleaner.trackedDeletions(results)
+            if !deleted.isEmpty {
+                print("\nWARNING: tracked files are gone in:")
+                for line in deleted { print("  \(line)") }
+            }
         } else {
             print("\nDry run: would remove \(formatBytes(bytes)) in \(results.count) items. Re-run with --apply to remove.")
         }

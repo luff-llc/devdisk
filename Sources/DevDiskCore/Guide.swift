@@ -51,6 +51,12 @@ enum Guide {
     - Release what you hold: `devdisk sim release --owner <id>`, `pressroom lease release <id>`.
     - Keep evidence small: keep logs, screenshots and reports, not the build tree that produced them.
 
+    Builds that stay small:
+    - Build Xcode projects into one git-ignored folder in the project:
+      `xcodebuild … -derivedDataPath DerivedData.noindex`. The `.noindex` ending keeps Spotlight out.
+    - Reuse one named simulator per project and shut it down after each task; erase it rather than
+      creating another.
+
     Protecting work in progress:
     - devdisk never calls something safe while a process is working inside it, names it on its
       command line, or a build tool that reads it (cargo, xcodebuild, swift-build, bun) is running.
